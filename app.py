@@ -1,22 +1,21 @@
 import os
 import json
-import base64
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from openai import OpenAI
+import google.generativeai as genai
 from PIL import Image
 import io
 
 app = Flask(__name__)
 CORS(app)
 
-# Configure OpenAI API
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'your-openai-api-key-here')
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'your-gemini-api-key-here')
+genai.configure(api_key=GEMINI_API_KEY)
 
-# Model configuration - using GPT-4 Vision for best accuracy (gpt-4o for cheaper option)
-MODEL_NAME = "gpt-4o"  # Options: "gpt-4o", "gpt-4-turbo", "gpt-4-vision-preview"
-print(f"✅ Using OpenAI model: {MODEL_NAME}")
+# Model configuration - using Gemini 1.5 Flash (stable, fast, and reliable)
+MODEL_NAME = "gemini-2.0-flash-001"  # Latest stable version with vision support
+print(f"✅ Using Gemini model: {MODEL_NAME}")
 
 # Complete Nutrition Analysis Prompt - Replicating "Calorie tracker" Custom GPT by shinywesley
 SYSTEM_PROMPT = """You are replicating the exact functionality of the "Calorie tracker" custom GPT by shinywesley - a highly-rated (4.6 stars, 100K+ conversations) specialized model that calculates calories from photos. Your task is to provide the perfect blend of a "calorie counter" and "nutrition tracker" offering detailed meal breakdowns and instant nutritional insights, exactly as the original custom GPT does.
@@ -157,55 +156,90 @@ def analyze_food():
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Convert image to base64 for OpenAI API
-        buffered = io.BytesIO()
-        image.save(buffered, format="JPEG", quality=95)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        
-        print(f"📸 Image size: {len(img_base64)} bytes (base64)")
+        print(f"📸 Image received")
         print(f"🖼️ Image dimensions: {image.size}")
         
-        # Prepare the message for OpenAI - emphasize JSON output
-        user_message = """Analyze this food image in detail. You MUST return ONLY a valid JSON object with no other text.
+        # Prepare the prompt for Gemini - emphasize JSON output
+        prompt = SYSTEM_PROMPT + "\n\n" + """Analyze this food image in detail. You MUST return ONLY a valid JSON object with no other text.
 
 Identify all food items visible, estimate portion sizes accurately using visual cues (plate size, utensils), account for cooking methods and oils, then return the exact JSON format with total_calories, protein, fats, carbs, fiber, items array, and analysis field."""
         
-        # Call OpenAI API with vision capability
-        print("🔄 Calling OpenAI API...")
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_message
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_base64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=2000,
-            temperature=0.2,  # Lower temperature for more consistent, accurate results
-            response_format={"type": "json_object"}  # Force JSON response
+        # Configure safety settings to allow food image analysis
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            }
+        ]
+        
+        # Call Gemini API with vision capability
+        print("🔄 Calling Gemini API...")
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(
+            [prompt, image],
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,  # Lower temperature for more consistent, accurate results
+                max_output_tokens=8192,  # Increased to allow full response
+            ),
+            safety_settings=safety_settings
         )
         
-        print("✅ OpenAI API response received")
+        print("✅ Gemini API response received")
+        
+        # Debug: Print response details
+        print(f"🔍 Response candidates: {len(response.candidates) if response.candidates else 0}")
+        if response.candidates:
+            print(f"🔍 Finish reason: {response.candidates[0].finish_reason}")
+            print(f"🔍 Safety ratings: {response.candidates[0].safety_ratings}")
+        
+        # Check if response was blocked
+        if not response.candidates:
+            print("❌ No candidates in response - blocked by safety filters")
+            return jsonify({
+                'error': 'Response was blocked by safety filters',
+                'details': 'The image analysis was blocked. Please try a different image.'
+            }), 400
+        
+        # Check finish reason
+        finish_reason = response.candidates[0].finish_reason
+        print(f"🔍 Checking finish_reason: {finish_reason} (type: {type(finish_reason)})")
+        
+        # Gemini finish_reason is an enum, need to check its value
+        # FINISH_REASON_UNSPECIFIED = 0, STOP = 1, MAX_TOKENS = 2, SAFETY = 3, RECITATION = 4, OTHER = 5
+        finish_reason_value = int(finish_reason) if hasattr(finish_reason, 'value') else finish_reason
+        
+        if finish_reason_value != 1:  # 1 = STOP (normal completion)
+            finish_reason_map = {
+                0: "UNSPECIFIED - Response not completed",
+                2: "MAX_TOKENS - Response truncated (increase max_output_tokens)",
+                3: "SAFETY - Content blocked by safety filters",
+                4: "RECITATION - Content blocked due to recitation",
+                5: "OTHER - Blocked for other reasons"
+            }
+            error_msg = finish_reason_map.get(finish_reason_value, f"Unknown finish reason: {finish_reason_value}")
+            print(f"❌ Non-normal finish reason: {error_msg}")
+            return jsonify({
+                'error': 'Analysis failed',
+                'details': error_msg,
+                'suggestion': 'Please try with a clearer food image'
+            }), 400
         
         # Parse the response
-        response_text = response.choices[0].message.content.strip()
+        response_text = response.text.strip()
         
-        print(f"📊 Raw OpenAI Response: {response_text[:200]}...")
+        print(f"📊 Raw Gemini Response: {response_text[:200]}...")
         
         # Remove markdown code blocks if present
         if response_text.startswith('```json'):
@@ -253,20 +287,20 @@ Identify all food items visible, estimate portion sizes accurately using visual 
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'model': MODEL_NAME, 'api': 'OpenAI'})
+    return jsonify({'status': 'healthy', 'model': MODEL_NAME, 'api': 'Gemini'})
 
 if __name__ == '__main__':
     # Check if API key is set
-    if OPENAI_API_KEY == 'YOUR_OPENAI_API_KEY_HERE':
+    if GEMINI_API_KEY == 'YOUR_GEMINI_API_KEY_HERE':
         print("\n" + "="*60)
-        print("⚠️  WARNING: Please set your OPENAI_API_KEY!")
+        print("⚠️  WARNING: Please set your GEMINI_API_KEY!")
         print("Set it as an environment variable:")
-        print("  Windows: $env:OPENAI_API_KEY='your-api-key-here'")
-        print("  Or edit app.py and replace YOUR_OPENAI_API_KEY_HERE")
+        print("  Windows: $env:GEMINI_API_KEY='your-api-key-here'")
+        print("  Or edit app.py and replace YOUR_GEMINI_API_KEY_HERE")
         print("="*60 + "\n")
     
     print("\n🚀 Calorie Tracker Server Starting...")
-    print(f"🤖 Using OpenAI API with model: {MODEL_NAME}")
+    print(f"🤖 Using Gemini API with model: {MODEL_NAME}")
     print("📍 Access the app at: http://localhost:5000")
     print("💡 Upload a food image to get nutritional analysis\n")
     
